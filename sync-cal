@@ -1,0 +1,170 @@
+#!/home/sevrins/proj/sync-cal/venv/bin/python
+
+import argparse
+from datetime import datetime, date, time, timedelta
+from pyexchange import Exchange2010Service, ExchangeNTLMAuthConnection
+import pprint
+from html2text import HTML2Text
+from optparse import OptionParser
+import os
+import httplib2
+import sys
+import re
+import approxidate
+import yaml
+from apiclient.discovery import build
+from oauth2client.file import Storage
+from oauth2client.client import AccessTokenRefreshError
+from oauth2client.client import OAuth2WebServerFlow
+from oauth2client import tools
+from oauth2client.tools import run_flow
+import logging
+
+UNLIKELY_DELIMITER = '///'
+
+def get_config():
+    with open('{}/.config/sync-cal.yaml'.format(os.getenv("HOME"))) as fh:
+        cfg = yaml.load(fh.read())
+    return cfg
+
+def get_owa_calendar():
+    cfg = get_config()
+    # Set up the connection to Exchange
+    connection = ExchangeNTLMAuthConnection(url=cfg['owa_url'],
+                                            username=cfg['owa_username'],
+                                            password=cfg['owa_password'])
+    
+    service = Exchange2010Service(connection)
+    return service.calendar()
+
+def get_google_calendar():
+
+    scope = 'https://www.googleapis.com/auth/calendar'
+    storage = Storage('%s/.gcal.credentials.dat' % os.getenv("HOME"))
+    credentials = storage.get()
+    if credentials is None or credentials.invalid:
+        flow = OAuth2WebServerFlow(client_id, client_secret, scope)
+
+        parser = argparse.ArgumentParser(parents=[tools.argparser])
+        flags = parser.parse_args()
+        credentials = tools.run_flow(flow, storage, flags)
+    http = httplib2.Http()
+    http = credentials.authorize(http)
+    service = build('calendar', 'v3', http=http)
+    return service
+
+def events_as_hash(events_list):
+    return { '%s%s%s' % (e['summary'],
+                         UNLIKELY_DELIMITER,
+                         e['start']['dateTime']) : e for e in events_list }
+
+def gcal_to_datetime(date_string):
+    return datetime.utcfromtimestamp(approxidate.approx(date_string))
+
+    
+def sync_calendars(start, end):
+    cfg = get_config()
+    target_calendar_id = cfg['target_calendar_id']
+    gcal = get_google_calendar()
+    owa_cal = get_owa_calendar()
+    gcal_events_list = gcal.events().list(calendarId= cfg['target_calendar_id'],
+                                          timeMin = to_gcal_date(start),
+                                          timeMax = to_gcal_date(end)
+                                          ).execute()['items']
+    for gcal_event in gcal_events_list:
+        gcal_event['start']['dateTime'] = to_gcal_date(gcal_to_datetime(gcal_event['start']['dateTime']))
+    gcal_events = events_as_hash(gcal_events_list)
+
+    owa_events_orig = owa_cal.list_events(start=start,
+                                          end=end,
+                                          details = True,
+                                          ).events
+    handler = HTML2Text()
+    owa_events_list = []
+    for owa_event in owa_events_orig:
+        if owa_event.availability == 'OOF':
+            continue
+
+        summary = ''
+        if owa_event.html_body:
+            summary = handler.handle(owa_event.html_body)
+        body = "%s\nOrganizer:\t%s\nAttendees:\t%s\n" % (summary,
+                                                         owa_event.organizer.name,
+                                                         "\n\t".join([a.name for a in owa_event._attendees.values()]))
+
+        owa_event_as_gcal = { 'summary': owa_event.subject,
+                              'location': owa_event.location,
+                              'start' : { 'dateTime': to_gcal_date(owa_event.start) },
+                              'end': { 'dateTime': to_gcal_date(owa_event.end) },
+                              'description': body
+                              }
+        owa_events_list.append(owa_event_as_gcal)
+
+    owa_events = events_as_hash(owa_events_list)
+
+    for gcal_event_key, gcal_event in gcal_events.iteritems():
+        if gcal_event_key not in owa_events:
+            print "Deleting %s" % gcal_event['summary']
+            gcal.events().delete(calendarId = cfg['target_calendar_id'],
+                                 eventId = gcal_event['id']).execute()
+
+    for owa_event_key, owa_event in owa_events.iteritems():
+        if owa_event_key not in gcal_events:
+            print "Adding %s" % owa_event['summary']
+            gcal.events().insert(calendarId=cfg['target_calendar_id'], body=owa_event).execute()
+
+
+def to_gcal_date(datestring):
+    return datestring.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def another_test():
+    owa_cal = get_owa_calendar()
+    events = owa_cal.list_events(start=start,
+                                 end=end,
+                                 details=True).events
+    for event in events:
+        pprint.pprint(event.__dict__)
+
+def gcal_test():
+    gcal = get_google_calendar()
+    cfg = get_config()
+    events = gcal.events().list(calendarId= cfg['target_calendar_id'],
+                                timeMax='2015-01-16T00:00:00+02:00',
+                                timeMin='2015-01-01T00:00:00+02:00',
+                                ).execute()
+    for event in events['items']:
+        pprint.pprint(event)
+        break
+
+def main():
+    opt_parser = OptionParser()
+    opt_parser.add_option('-s', '--start', dest = 'start')
+    opt_parser.add_option('-e', '--end', dest = 'end')
+    (options, args) = opt_parser.parse_args()
+    if options.start:
+        start_date = datetime.strptime(options.start, "%Y-%m-%d")
+    else:
+        start_date = datetime.combine(date.today(), time(0,0,0)) - timedelta(days = 3)
+
+    if options.end:
+        end_date = datetime.strptime(options.end, "%Y-%m-%d")
+    else:
+        end_date = datetime.combine(date.today(), time(0,0,0)) + timedelta(days = 13)
+
+
+    logger = logging.getLogger("sync-cal")
+    logger.setLevel(logging.DEBUG)
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    logger.info("Starting run")
+    sync_calendars(start = start_date,
+                   end = end_date)
+                   
+
+if __name__ == '__main__':
+    main()
